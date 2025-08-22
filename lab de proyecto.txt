@@ -1,0 +1,249 @@
+lab de proyecto 
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ==============================================================================
+#  setup-galera.sh
+#  Script documentado para instalar y configurar MariaDB + Galera (3 nodos)
+#  en Ubuntu 22.04/24.04.
+#
+#  Ejecutar en CADA nodo con sus parámetros. Soporta:
+#    - Bootstrap del primer nodo
+#    - SST por rsync (simple) o mariabackup (recomendado prod)
+#    - NTP por systemd-timesyncd (default) o chrony
+#    - Apertura de puertos con UFW (opcional)
+#
+#  Ejemplos:
+#   sudo bash setup-galera.sh \
+#     --node-name db1 --node-ip 10.0.0.11 \
+#     --cluster-ips 10.0.0.11,10.0.0.12,10.0.0.13 \
+#     --bootstrap yes --sst rsync --configure-ufw yes --cidr 10.0.0.0/24
+#
+#   sudo bash setup-galera.sh \
+#     --node-name db2 --node-ip 10.0.0.12 \
+#     --cluster-ips 10.0.0.11,10.0.0.12,10.0.0.13 \
+#     --sst mariabackup --sst-user sst --sst-pass 'SSTpass!' --configure-ufw yes
+# ==============================================================================
+
+# ----------------------------- Parámetros -------------------------------------
+NODE_NAME=""
+NODE_IP=""
+CLUSTER_IPS=""
+CLUSTER_NAME="mi_cluster_prod"
+SST_METHOD="rsync"                 # rsync | mariabackup
+SST_USER="sst"
+SST_PASS=""                        # si vacío y mariabackup, se generará
+BOOTSTRAP="no"                     # yes | no
+USE_CHRONY="no"                    # yes | no  (si no, se usa timesyncd)
+CONFIGURE_UFW="no"                 # yes | no
+CIDR="10.0.0.0/24"                 # red permitida para puertos
+UBUNTU_SUITE="$(lsb_release -cs 2>/dev/null || echo noble)"  # jammy|noble
+
+usage() {
+  cat <<EOF
+Uso:
+  sudo bash $0 --node-name <db1|db2|db3> --node-ip <IP> --cluster-ips <ip1,ip2,ip3> [opciones]
+
+Opciones:
+  --cluster-name <nombre>       Nombre del cluster (default: ${CLUSTER_NAME})
+  --sst <rsync|mariabackup>     Método SST (default: ${SST_METHOD})
+  --sst-user <usuario>          Usuario SST (default: ${SST_USER})
+  --sst-pass <password>         Password SST (si vacío y mariabackup, se genera)
+  --bootstrap <yes|no>          Bootstrap en este nodo (default: ${BOOTSTRAP})
+  --use-chrony <yes|no>         Usar chrony (si no, timesyncd) (default: ${USE_CHRONY})
+  --configure-ufw <yes|no>      Instalar y abrir puertos con UFW (default: ${CONFIGURE_UFW})
+  --cidr <CIDR>                 Red permitida UFW (default: ${CIDR})
+  --ubuntu-suite <jammy|noble>  Suite del repo MariaDB (auto: ${UBUNTU_SUITE})
+
+Ejemplo bootstrap (db1):
+  sudo bash $0 --node-name db1 --node-ip 10.0.0.11 --cluster-ips 10.0.0.11,10.0.0.12,10.0.0.13 --bootstrap yes
+
+Ejemplo nodos restantes:
+  sudo bash $0 --node-name db2 --node-ip 10.0.0.12 --cluster-ips 10.0.0.11,10.0.0.12,10.0.0.13
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --node-name) NODE_NAME="$2"; shift 2;;
+    --node-ip) NODE_IP="$2"; shift 2;;
+    --cluster-ips) CLUSTER_IPS="$2"; shift 2;;
+    --cluster-name) CLUSTER_NAME="$2"; shift 2;;
+    --sst) SST_METHOD="$2"; shift 2;;
+    --sst-user) SST_USER="$2"; shift 2;;
+    --sst-pass) SST_PASS="$2"; shift 2;;
+    --bootstrap) BOOTSTRAP="$2"; shift 2;;
+    --use-chrony) USE_CHRONY="$2"; shift 2;;
+    --configure-ufw) CONFIGURE_UFW="$2"; shift 2;;
+    --cidr) CIDR="$2"; shift 2;;
+    --ubuntu-suite) UBUNTU_SUITE="$2"; shift 2;;
+    -h|--help) usage; exit 0;;
+    *) echo "Parámetro desconocido: $1"; usage; exit 1;;
+  esac
+done
+
+[[ -z "$NODE_NAME" || -z "$NODE_IP" || -z "$CLUSTER_IPS" ]] && { usage; exit 1; }
+
+echo "==> Parámetros efectivos:"
+echo "    NODE_NAME      = $NODE_NAME"
+echo "    NODE_IP        = $NODE_IP"
+echo "    CLUSTER_IPS    = $CLUSTER_IPS"
+echo "    CLUSTER_NAME   = $CLUSTER_NAME"
+echo "    SST_METHOD     = $SST_METHOD"
+echo "    BOOTSTRAP      = $BOOTSTRAP"
+echo "    USE_CHRONY     = $USE_CHRONY"
+echo "    CONFIGURE_UFW  = $CONFIGURE_UFW"
+echo "    CIDR           = $CIDR"
+echo "    UBUNTU_SUITE   = $UBUNTU_SUITE"
+echo
+
+# ------------------------ 0) Preparación / NTP --------------------------------
+echo "==> [0] Preparación y NTP"
+apt-get update -y
+apt-get install -y curl gnupg apt-transport-https lsb-release socat rsync netcat
+
+if [[ "$USE_CHRONY" == "yes" ]]; then
+  echo "    Instalando y habilitando chrony..."
+  apt-get install -y chrony
+  systemctl enable --now chrony
+  systemctl is-active --quiet chrony && echo "    chrony activo."
+else
+  echo "    Usando systemd-timesyncd..."
+  timedatectl set-ntp true
+  systemctl enable --now systemd-timesyncd || true
+fi
+timedatectl status | sed -n '1,8p' || true
+echo
+
+# ---------------------- 1) Repositorio MariaDB 10.11 --------------------------
+echo "==> [1] Añadiendo repositorio oficial MariaDB 10.11 (${UBUNTU_SUITE})"
+mkdir -p /etc/apt/keyrings
+curl -fsSL https://mariadb.org/mariadb_release_signing_key.pgp -o /etc/apt/keyrings/mariadb-keyring.pgp
+cat >/etc/apt/sources.list.d/mariadb.sources <<EOF
+Types: deb
+URIs: https://mirror.mariadb.org/repo/10.11/ubuntu
+Suites: ${UBUNTU_SUITE}
+Components: main
+Signed-By: /etc/apt/keyrings/mariadb-keyring.pgp
+EOF
+apt-get update -y
+
+# ---------------------- 2) Instalar MariaDB + Galera --------------------------
+echo "==> [2] Instalando MariaDB + Galera"
+apt-get install -y mariadb-server galera-4
+if [[ "$SST_METHOD" == "mariabackup" ]]; then
+  echo "    Instalando mariadb-backup para SST mariabackup..."
+  apt-get install -y mariadb-backup
+fi
+
+# ---------------------- 3) Configurar Galera ----------------------------------
+echo "==> [3] Configurando Galera en /etc/mysql/mariadb.conf.d/60-galera.cnf"
+CONF_FILE="/etc/mysql/mariadb.conf.d/60-galera.cnf"
+
+cat >"$CONF_FILE" <<EOF
+[server]
+bind-address = 0.0.0.0
+binlog_format = ROW
+default_storage_engine = InnoDB
+innodb_autoinc_lock_mode = 2
+wsrep_on = ON
+wsrep_provider = /usr/lib/galera/libgalera_smm.so
+
+wsrep_cluster_name = "${CLUSTER_NAME}"
+wsrep_cluster_address = "gcomm://${CLUSTER_IPS}"
+
+wsrep_node_name = "${NODE_NAME}"
+wsrep_node_address = "${NODE_IP}"
+
+wsrep_sst_method = ${SST_METHOD}
+EOF
+
+if [[ "$SST_METHOD" == "mariabackup" ]]; then
+  # Generar password si no se pasó
+  if [[ -z "$SST_PASS" ]]; then
+    SST_PASS="$(tr -dc 'A-Za-z0-9!@#%^&*' </dev/urandom | head -c 16)"
+    echo "    (Generado SST_PASS: ${SST_PASS})"
+  fi
+  echo "wsrep_sst_auth = ${SST_USER}:${SST_PASS}" >> "$CONF_FILE"
+fi
+
+echo "    Archivo escrito:"
+grep -E 'wsrep_|bind-address|binlog_format|innodb_autoinc' "$CONF_FILE" | sed 's/^/    /'
+echo
+
+# ---------------------- 4) Firewall opcional (UFW) ----------------------------
+if [[ "$CONFIGURE_UFW" == "yes" ]]; then
+  echo "==> [4] Configurando UFW y abriendo puertos Galera para ${CIDR}"
+  apt-get install -y ufw
+  ufw allow from "${CIDR}" to any port 3306 proto tcp
+  ufw allow from "${CIDR}" to any port 4567 proto tcp
+  ufw allow from "${CIDR}" to any port 4567 proto udp
+  ufw allow from "${CIDR}" to any port 4568 proto tcp
+  ufw allow from "${CIDR}" to any port 4444 proto tcp
+  ufw --force enable
+else
+  echo "==> [4] Saltando configuración UFW (CONFIGURE_UFW = no)"
+fi
+echo
+
+# ---------------------- 5) Bootstrap / Start ----------------------------------
+echo "==> [5] Arranque del servicio MariaDB/Galera"
+systemctl stop mariadb || true
+
+if [[ "$BOOTSTRAP" == "yes" ]]; then
+  echo "    -> Bootstrap de cluster en ${NODE_NAME}"
+  if command -v galera_new_cluster >/dev/null 2>&1; then
+    galera_new_cluster
+  else
+    # Alternativa equivalente
+    systemctl start mariadb --wsrep-new-cluster
+  fi
+
+  # Si SST=mariabackup, crear el usuario en el cluster (una vez es suficiente)
+  if [[ "$SST_METHOD" == "mariabackup" ]]; then
+    echo "    Creando usuario SST en el cluster (si no existe)..."
+    mysql -uroot -e "CREATE USER IF NOT EXISTS '${SST_USER}'@'%' IDENTIFIED BY '${SST_PASS}';"
+    mysql -uroot -e "GRANT RELOAD, LOCK TABLES, PROCESS, REPLICATION CLIENT ON *.* TO '${SST_USER}'@'%';"
+    mysql -uroot -e "GRANT ALL PRIVILEGES ON *.* TO '${SST_USER}'@'%';"
+    echo "    Usuario SST listo."
+  fi
+else
+  echo "    -> Inicio normal (unión al cluster ya bootstrapped en otro nodo)"
+  systemctl start mariadb
+fi
+
+sleep 2
+echo "    Estado wsrep (resumen):"
+mysql -uroot -e "SHOW STATUS LIKE 'wsrep_cluster_size';" 2>/dev/null || true
+mysql -uroot -e "SHOW STATUS LIKE 'wsrep_cluster_status';" 2>/dev/null || true
+mysql -uroot -e "SHOW STATUS LIKE 'wsrep_local_state_comment';" 2>/dev/null || true
+echo
+
+# ---------------------- 6) Tips de verificación --------------------------------
+cat <<'EOT'
+
+==> [6] Verificación rápida (ejecútalo manualmente donde quieras):
+  mysql -uroot -e "SHOW STATUS LIKE 'wsrep_cluster_size';"
+  mysql -uroot -e "SHOW STATUS LIKE 'wsrep_cluster_status';"          # Primary esperado
+  mysql -uroot -e "SHOW STATUS LIKE 'wsrep_local_state_comment';"     # Synced esperado
+
+==> Prueba de replicación:
+  # En cualquier nodo:
+  mysql -uroot -e "CREATE DATABASE prueba_galera; \
+  CREATE TABLE prueba_galera.t1 (id INT PRIMARY KEY, txt VARCHAR(20)); \
+  INSERT INTO prueba_galera.t1 VALUES(1,'ok');"
+
+  # En otro nodo:
+  mysql -uroot -e "SELECT * FROM prueba_galera.t1;"
+
+==> Diagnóstico si un nodo no entra:
+  journalctl -u mariadb -n 200 --no-pager | egrep -i 'wsrep|sst|gcomm|error|warn'
+  nc -vz <IP_donante> 4444
+  nc -vz <IP_donante> 4568
+  nc -vz <IP_destino> 4567
+  timedatectl status
+EOT
+
+echo "==> ¡Listo! Repite el script en los demás nodos con sus parámetros."
+

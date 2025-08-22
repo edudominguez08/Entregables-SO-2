@@ -1,0 +1,89 @@
+#!/bin/bash
+# Script para configurar y lanzar el laboratorio de contenedores
+
+echo " Creando directorio public_html..."
+mkdir -p public_html
+echo "<h1>¡Hola desde el contenedor web!</h1>" > public_html/index.html
+
+echo " Creando red personalizada..."
+docker network create misitio-net
+
+echo " Ejecutando contenedor de base de datos..."
+docker run -d --name misitiodb \
+  --network misitio-net \
+  -e MYSQL_ROOT_PASSWORD=carlos.123 \
+  -e MYSQL_USER=carlos \
+  -e MYSQL_PASSWORD=carlos.123 \
+  -e MYSQL_DATABASE=misitiodb \
+  -v websitedbvolume:/var/lib/mysql \
+  mariadb:latest
+
+echo "Ejecutando contenedor de servidor web..."
+docker run -d --name sitio \
+  --network misitio-net \
+  -p 8081:80 \
+  -v "$(pwd)/public_html:/var/www/html" \
+  php:apache
+
+echo "Contenedores en ejecución:"
+docker ps
+
+version: '3'
+services:
+  sitio:
+    image: php:apache
+    container_name: sitio
+    ports:
+      - 8081:80
+    volumes:
+      - ./public_html:/var/www/html
+    networks:
+      - misitio-net
+
+  misitiodb:
+    image: mariadb:latest
+    container_name: misitiodb
+    volumes:
+      - websitedbvolume:/var/lib/mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: "carlos.123"
+      MYSQL_USER: "carlos"
+      MYSQL_PASSWORD: "carlos.123"
+      MYSQL_DATABASE: misitiodb
+    networks:
+      - misitio-net
+
+networks:
+  misitio-net:
+
+volumes:
+  websitedbvolume:
+
+isntalacion docker compose 
+
+sudo curl -L "https://github.com/docker/compose/releases/download/1.29.2/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+sudo chmod +x /usr/local/bin/docker-compose
+docker-compose --version
+
+
+docker-compose up -d
+
+docker build -t miprimeraimagen:v1 .
+
+# Construir imagen y levantar contenedores
+docker-compose build
+docker-compose up -d
+
+# Ver contenedores
+docker-compose ps
+
+# Logs en tiempo real
+docker-compose logs -f
+
+# Acceso terminal dentro del contenedor
+docker-compose exec sitio bash
+
+# Detener y eliminar servicios
+docker-compose stop
+docker-compose rm
+
